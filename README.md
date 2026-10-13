@@ -398,8 +398,3 @@ The project CV reports reducing repository-ingestion latency from approximately 
 Dense embeddings are generated through the OpenAI API, with concurrent batches. Hosted Cohere reranking is used when configured; otherwise, reranking falls back to the local CrossEncoder.
 
 Query latency depends on network access and the configured providers. Repository ingestion and query-answering latency are separate measurements.
-
-
-## License
-
-See the repository's license file for usage and distribution terms.
