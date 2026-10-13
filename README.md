@@ -399,29 +399,6 @@ Dense embeddings are generated through the OpenAI API, with concurrent batches. 
 
 Query latency depends on network access and the configured providers. Repository ingestion and query-answering latency are separate measurements.
 
-## Known Limitations
-
-- **Citation validation is not semantic proof.** A real source location may still be interpreted incorrectly by the LLM.
-- **Call-graph extraction is approximate.** Regex-based extraction cannot resolve every dynamic call, reflection pattern, or dependency-injection relationship.
-- **No incremental re-indexing.** A repository index represents a snapshot. New commits require re-ingestion.
-- **Local Qdrant mode limits concurrency.** The backend serializes pipeline access with a process-wide lock when using local on-disk storage. A Qdrant server or cloud deployment is more appropriate for concurrent workloads.
-- **SQLite is the default database.** Configure a suitable database such as PostgreSQL for a larger deployment.
-- **Fallback chunking is line-based.** Unsupported file formats fall back to line windows rather than full AST parsing.
-- **Broad conceptual questions remain challenging.** Questions that require information distributed across many files may not retrieve sufficient evidence and can result in a refusal.
-- **Evaluation requires API access and credits.** DeepEval's LLM-based judges can be expensive and sensitive to model choice and context length.
-- **Repository freshness is not automatic.** The system does not continuously synchronize an index with new repository commits.
-
-## Future Improvements
-
-Potential improvements include:
-
-- Incremental re-indexing after Git commits.
-- More robust call-graph construction using language-aware symbol resolution.
-- Better query decomposition for questions spanning multiple files.
-- Broader evaluation datasets with source-derived reference answers.
-- End-to-end regression evaluation after changes to retrieval, reranking, or generation.
-- Improved citation verification that evaluates semantic support in addition to source provenance.
-- Better observability for indexing latency, retrieval quality, and per-stage query latency.
 
 ## License
 
