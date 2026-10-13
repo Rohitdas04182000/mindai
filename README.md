@@ -1,244 +1,428 @@
-# MindAI
+# MindAI — Graph-RAG Chatbot for GitHub Repositories
 
-A Graph-RAG chatbot that answers questions about any GitHub repository with
-verifiable, line-level citations — and refuses rather than guess when the
-retrieved code can't support an answer.
+MindAI is a codebase question-answering assistant that uses Retrieval-Augmented Generation (RAG) to answer natural-language questions about GitHub repositories with verifiable, line-level source citations.
 
-## How it works
+It combines tree-sitter AST-aware code chunking, Qdrant-native hybrid retrieval, Reciprocal Rank Fusion (RRF), reranking, conditional call-graph expansion, and LangGraph workflow orchestration.
 
+The system validates generated citations against the retrieved source context. If validation fails, it retries once and then refuses rather than returning a response with unsupported source references.
+
+## Key Features
+
+- **AST-aware code chunking:** Uses tree-sitter to identify meaningful code structures such as functions and classes.
+- **Hybrid retrieval:** Combines dense vector search with BM25-style sparse search using Qdrant.
+- **Reciprocal Rank Fusion:** Merges dense and sparse rankings without directly combining incomparable raw scores.
+- **Reranking:** Uses Cohere reranking when configured, with a local sentence-transformers CrossEncoder fallback.
+- **Conditional graph expansion:** Uses caller/callee relationships to retrieve additional code for trace and call-chain questions when initial retrieval appears insufficient.
+- **Citation validation:** Rejects citations to files or line ranges outside the retrieved context and retries once before refusing.
+- **RAG evaluation:** Provides DeepEval scripts for faithfulness, answer relevancy, and contextual recall.
+- **Automated tests:** Includes a 59-test offline pytest suite covering retrieval fusion, citation validation, input validation, and graph-expansion routing.
+- **Web application:** Provides a FastAPI backend and React frontend with authentication, repository management, chat history, and server-sent events (SSE).
+
+## Architecture
+
+```text
+                 REPOSITORY INGESTION
+                          |
+                          v
+                   GitHub Repository
+                          |
+                          v
+                   Shallow Clone
+                          |
+                          v
+                   File Filtering
+                          |
+                          v
+                 tree-sitter / AST
+                          |
+                          v
+                  AST-aware Chunking
+                          |
+                          v
+                   Code + Metadata
+                          |
+                    +-----+-----+
+                    |           |
+                    v           v
+              Dense Embedding  Sparse Embedding
+              OpenAI API       FastEmbed
+                    |           |
+                    +-----+-----+
+                          |
+                          v
+                   Qdrant Collection
+                 Named Dense + Sparse Vectors
+                          |
+                          v
+                 QUESTION-ANSWERING
+                          |
+                          v
+                    User Question
+                          |
+                          v
+                    Query Rewrite
+                          |
+                          v
+                 Hybrid Retrieval
+                   /           \
+                  v             v
+             Dense Search    Sparse Search
+                   \           /
+                    v         v
+                      RRF Fusion
+                          |
+                          v
+                       Reranking
+                          |
+                          v
+                Conditional Graph Expansion
+                          |
+                          v
+                   Context Assembly
+                          |
+                          v
+                    LLM Generation
+                          |
+                          v
+                 Citation Validation
+                    /           \
+               Valid             Invalid
+                 |                  |
+                 v                  v
+             Final Answer      One Retry
+                                    |
+                                    v
+                           Refusal if Still Invalid
 ```
-ingestion.py    Shallow-clones a repo (--depth 1), parses it with
-                tree-sitter into AST-aware chunks (whole functions and
-                classes, not fixed token windows), embeds each chunk twice
-                — dense via OpenAI text-embedding-3-small, sparse/BM25
-                via FastEmbed locally — and upserts both as NAMED VECTORS
-                on a single Qdrant point. Also extracts a caller/callee
-                call graph, and skips credential files outright.
 
-graph.py        A LangGraph pipeline of five nodes: query rewrite ->
-                hybrid retrieval (dense + sparse, fused via Reciprocal
-                Rank Fusion) -> reranking -> conditional graph expansion
-                (callers/callees, only for trace questions with weak
-                retrieval) -> generation. Every answer must cite
-                `path:line`; citations are verified against the retrieved
-                context AFTER generation, and an answer citing anything
-                that wasn't retrieved is discarded.
+## How It Works
 
-eval.py         DeepEval metric definitions (Faithfulness 0.75, Answer
-                Relevancy 0.70, Contextual Recall 0.70) plus a mock gold
-                dataset that runs standalone.
+### 1. Repository Ingestion
 
-eval_live.py    The same metrics against an already-indexed repo.
-eval_hard.py    Ditto, with ground truth written from the source rather
-                than from the system's own answers — see "Evaluation".
-```
+The ingestion pipeline shallow-clones the target repository, filters out irrelevant files and credential files, and processes supported source-code languages.
 
-`ingestion.py`, `graph.py`, and `eval.py` are the backbone — they run
-standalone from the CLI with no web server required. `backend/` and
-`frontend/` are a thin web UI wrapped around that backbone: FastAPI for
-auth/persistence/HTTP, React for the chat interface. Neither changes how
-retrieval, reranking, or generation actually work.
+Tree-sitter parses source code into an Abstract Syntax Tree (AST). AST-aware chunking uses code structure to create meaningful retrieval units rather than relying exclusively on arbitrary fixed-size text windows.
 
-### The retrieval path, precisely
+Each chunk carries metadata such as its file path, line range, symbol information, and source content. This metadata enables the system to associate retrieved evidence with its original location.
 
-Hybrid search here is **Qdrant-native**, which is worth stating because it is
-easy to describe wrongly: FastEmbed builds BM25-style sparse vectors
-*locally at ingestion time*, those vectors are stored in Qdrant alongside the
-dense ones, and **Qdrant performs both the dense and the sparse search**.
-There is no separate local BM25 index and no second search engine. RRF then
-fuses the two ranked lists by rank position — not by score, because cosine
-similarity (~0.87) and BM25 (~14.2) are not on comparable scales.
+For languages and file types that cannot be parsed by tree-sitter, the system uses line-based fallback chunking.
 
-Two top-100 searches yield **100–200 unique candidates** after
-deduplication, not a fixed number.
+### 2. Embeddings and Indexing
 
-### Repository isolation
+Each code chunk is represented using two types of vectors:
 
-Each repo gets **its own Qdrant collection** (`repo_<uuid>`), so chunks from
-different repositories are never in the same index and cross-repo leakage is
-structurally impossible. Ownership is additionally enforced per user on every
-API route: another user's conversation returns **404, not 403**, so its
-existence isn't disclosed.
+- **Dense vectors:** Generated using OpenAI's `text-embedding-3-small` embedding model for semantic retrieval.
+- **Sparse vectors:** Generated locally using FastEmbed's BM25-style sparse embedding model for lexical retrieval.
 
-## Project layout
+Both named vectors and their associated payload metadata are stored on the same Qdrant point.
 
-```
+Each repository receives its own Qdrant collection, keeping its indexed code separate from other repositories.
+
+### 3. Hybrid Retrieval and RRF
+
+When a user asks a question, MindAI rewrites the query and performs dense and sparse searches against Qdrant.
+
+Dense retrieval helps locate code based on semantic similarity, while sparse retrieval helps find exact identifiers, function names, constants, and keywords.
+
+The two ranked lists are combined using Reciprocal Rank Fusion:
+
+\[
+\operatorname{RRF}(d)=
+\sum_{r\in R}\frac{1}{k+\operatorname{rank}_r(d)}
+\]
+
+Here, \(d\) is a document, \(R\) represents the ranked result lists, and \(k\) is a smoothing constant.
+
+RRF combines results according to their ranks rather than adding raw dense and sparse scores, which operate on different scales.
+
+The implementation retrieves up to 100 candidates from each search, fuses their rankings, deduplicates the results, and passes the candidate chunks to reranking.
+
+### 4. Reranking
+
+The reranking stage evaluates the relevance of retrieved code chunks to the rewritten question.
+
+MindAI supports two reranking paths:
+
+- **Cohere:** Uses the hosted Cohere Rerank API when `MINDAI_COHERE_API_KEY` is configured.
+- **Local fallback:** Uses the `cross-encoder/ms-marco-MiniLM-L-6-v2` CrossEncoder when Cohere is not configured.
+
+The reranked candidates are used to construct the context supplied to the LLM.
+
+### 5. Conditional Call-Graph Expansion
+
+For questions that involve tracing execution or understanding caller/callee relationships, the graph can expand the retrieved context using extracted call-graph relationships.
+
+Expansion is conditional rather than unconditional: the query must resemble a trace or call-chain question, and the initial retrieval must appear insufficient.
+
+The call graph is extracted using source-code pattern matching. It is therefore approximate and cannot resolve every dynamic call, reflective invocation, or dependency-injection relationship.
+
+### 6. Answer Generation
+
+The final generation stage receives the user's question and the retrieved code context.
+
+The LLM uses that evidence to produce a natural-language explanation. The generation instructions require source citations for factual claims and encourage refusal when the available evidence does not support a useful answer.
+
+The source metadata allows citations to identify files and line ranges.
+
+### 7. Citation Validation
+
+Citation validation is performed after generation.
+
+The validator checks:
+
+- Whether the cited file is represented in the retrieved context.
+- Whether the cited line range overlaps a line range retrieved for that file.
+- Whether the citation follows the accepted source-reference format.
+
+If validation fails, MindAI retries once with the valid retrieved paths available to the generation stage. If the retry still fails validation, the system returns a refusal instead of the unsupported response.
+
+**Important limitation:** Citation validation checks source provenance and line-range overlap. It does not independently prove that the cited lines semantically support every claim. Faithfulness evaluation is used to assess grounding at the answer level.
+
+## Technology Stack
+
+| Component | Technology |
+|---|---|
+| Workflow orchestration | LangGraph |
+| Language model and dense embeddings | OpenAI API |
+| Vector database | Qdrant |
+| Sparse embeddings | FastEmbed |
+| Code parsing | tree-sitter |
+| Ranking fusion | Reciprocal Rank Fusion |
+| Reranking | Cohere Rerank API / sentence-transformers CrossEncoder |
+| RAG evaluation | DeepEval |
+| Backend | FastAPI |
+| Frontend | React, Vite, Tailwind CSS |
+| Authentication and persistence | JWT, SQLAlchemy, SQLite by default |
+| Testing | pytest |
+
+## Project Structure
+
+```text
 mindai/
-├── ingestion.py, graph.py, eval.py   Core RAG pipeline (see above)
-├── eval_live.py, eval_hard.py        Evaluation against a live index
-├── dense_embeddings.py               OpenAI dense embedder (concurrent batches)
-├── reranker.py                       Cohere reranking provider
-├── semantic_chunking.py              Alternative embedding-derived chunking
-├── requirements.txt                  Core pipeline dependencies
-├── tests/test_pipeline.py            59 offline tests (no API keys needed)
-├── backend/                          FastAPI wrapper (auth, DB, HTTP API)
-│   ├── main.py                       Routes: auth, repos, conversations, chat (SSE)
-│   ├── auth.py, db.py, models.py, schemas.py, pipeline_store.py
-│   └── requirements.txt              Backend deps (includes ../requirements.txt)
-└── frontend/                         React + Vite + Tailwind chat UI
-    └── src/{pages,components,lib}/
+├── ingestion.py             # Repository ingestion and indexing
+├── graph.py                 # LangGraph RAG workflow
+├── dense_embeddings.py      # Dense embedding provider
+├── reranker.py              # Cohere reranking integration
+├── semantic_chunking.py     # Alternative semantic chunking strategy
+├── eval.py                  # DeepEval metrics and standalone mock evaluation
+├── eval_live.py             # Evaluation against an indexed repository
+├── eval_hard.py             # Evaluation with source-derived reference answers
+├── tests/
+│   └── test_pipeline.py     # Offline pipeline tests
+├── backend/
+│   ├── main.py              # FastAPI application and routes
+│   ├── auth.py              # Authentication
+│   ├── db.py                # Database configuration
+│   ├── models.py            # Persistence models
+│   ├── schemas.py            # Request/response schemas
+│   └── pipeline_store.py    # Pipeline and repository state
+├── frontend/
+│   ├── src/
+│   └── package.json
+├── requirements.txt
+└── README.md
 ```
 
-## Running it
+## Getting Started
 
-### 1. Core pipeline only (CLI, no web server)
+### Prerequisites
 
+- Python installed
+- Node.js and npm installed
+- An OpenAI API key for the embedding and generation calls
+- An optional Cohere API key for hosted reranking
+
+### 1. Clone the Repository
+
+```bash
+git clone https://github.com/Rohitdas04182000/mindai.git
+cd mindai
 ```
+
+### 2. Install Core Dependencies
+
+```bash
 pip install -r requirements.txt
-python ingestion.py https://github.com/<owner>/<repo>
-python graph.py https://github.com/<owner>/<repo> "How does X work?"
+```
+
+### 3. Configure Environment Variables
+
+Create a `.env` file in the repository root.
+
+At minimum, configure:
+
+```dotenv
+OPENAI_API_KEY=your_openai_api_key
+MINDAI_JWT_SECRET=your_secure_random_secret
+```
+
+Generate a random JWT secret with:
+
+```bash
+python -c "import secrets; print(secrets.token_urlsafe(32))"
+```
+
+Optional configuration:
+
+| Variable | Purpose |
+|---|---|
+| `QDRANT_URL` | Qdrant server or cloud URL |
+| `QDRANT_API_KEY` | Authentication for hosted Qdrant |
+| `MINDAI_QDRANT_PATH` | Local Qdrant storage directory |
+| `DATABASE_URL` | Database connection string; defaults to SQLite |
+| `MINDAI_GENERATION_MODEL` | Model used for answer generation |
+| `MINDAI_REWRITE_MODEL` | Model used for query rewriting |
+| `MINDAI_JUDGE_MODEL` | Model used by DeepEval judges |
+| `MINDAI_COHERE_API_KEY` | Enables hosted Cohere reranking |
+| `MINDAI_CHUNK_STRATEGY` | Selects `ast` or `semantic` chunking |
+| `MINDAI_JUDGE_SPACING` | Delay between evaluation judge calls |
+
+Changing the chunking strategy requires re-ingesting the repository.
+
+### 4. Run the Core Pipeline
+
+Ingest a repository:
+
+```bash
+python ingestion.py https://github.com/owner/repository
+```
+
+Ask a question:
+
+```bash
+python graph.py https://github.com/owner/repository "How does authentication work?"
+```
+
+Run the standalone mock evaluation:
+
+```bash
 python eval.py
 ```
 
-Note that `python graph.py` **re-ingests the repo before answering** — it
-clones, chunks and embeds from scratch on every invocation, which costs
-minutes and a full round of embedding calls per question. It exists for
-one-off inspection of the pipeline, not for repeated querying. Use the web
-app (or `eval_live.py`) to ask many questions against one index.
+**Note:** The command-line question-answering path re-ingests the repository before answering. It is intended for one-off pipeline inspection. For repeated questions against one index, use the web application or the live evaluation script.
 
-### 2. Full web app (backend + frontend)
+### 5. Run the Backend
 
-**Set up `.env`** in the project root. Copy `.env.example` to `.env` and fill
-it in. At minimum you need:
+Install backend dependencies:
 
-```
-OPENAI_API_KEY=sk-...
-MINDAI_JWT_SECRET=<python -c "import secrets; print(secrets.token_urlsafe(32))">
-```
-
-Optional, all with working defaults:
-
-| Variable | Default | Effect |
-|---|---|---|
-| `QDRANT_URL` / `QDRANT_API_KEY` | unset | Set → Qdrant server/cloud. Unset → local on-disk |
-| `MINDAI_QDRANT_PATH` | `./qdrant_storage` | Local storage directory |
-| `DATABASE_URL` | `sqlite:///./mindai.db` | Any SQLAlchemy URL (Postgres for production) |
-| `MINDAI_GENERATION_MODEL` | `gpt-4o-mini` | Answer generation |
-| `MINDAI_REWRITE_MODEL` | `gpt-4o-mini` | Query rewriting |
-| `MINDAI_JUDGE_MODEL` | `gpt-4o` | DeepEval judge |
-| `MINDAI_COHERE_API_KEY` | unset | Set → Cohere hosted reranking. Unset → local CrossEncoder |
-| `MINDAI_CHUNK_STRATEGY` | `ast` | `ast` or `semantic`. Changing it requires re-ingesting |
-
-**Install and start the backend:**
-```
+```bash
 pip install -r backend/requirements.txt
+```
+
+Start the FastAPI application:
+
+```bash
 python -m uvicorn backend.main:app --reload --port 8001
 ```
-First startup takes 1–2 minutes: the embedding and reranker models load
-before the server accepts requests. Port 8000 may already be in use — check
-with `netstat -ano | findstr :8000` on Windows, or pick any free port and
-update `frontend/vite.config.ts`'s proxy target to match.
 
-**Install and start the frontend** (separate terminal):
-```
+### 6. Run the Frontend
+
+Open a separate terminal:
+
+```bash
 cd frontend
 npm install
 npm run dev
 ```
 
-Open **http://localhost:5173** — sign up, ingest a repo from the sidebar,
-ask it questions.
+Open `http://localhost:5173` in your browser, register or sign in, ingest a repository, and start asking questions.
 
-### 3. Tests
+The application uses server-sent events to send status updates and the completed answer to the frontend. The current implementation does not stream individual LLM tokens as they are generated.
 
-```
+## Testing
+
+MindAI includes a pytest suite covering core pipeline behavior.
+
+Run the tests with:
+
+```bash
 python -m pytest tests/test_pipeline.py -q
 ```
 
-59 tests, all offline — no OpenAI, Cohere, or Qdrant needed. They cover URL
-validation, credential-file filtering, RRF correctness and deduplication,
-citation validation, context limits, and graph-expansion routing.
+The documented test run reports 59 passing tests. The suite covers:
+
+- GitHub URL validation.
+- Credential-file filtering.
+- RRF scoring and result deduplication.
+- Citation validation, including fabricated paths and line ranges.
+- Context-size limits.
+- Conditional graph-expansion routing.
+- Chunking-related constraints.
+
+These are offline tests and do not require live OpenAI, Cohere, or Qdrant services.
 
 ## Evaluation
 
+MindAI includes three evaluation entry points:
+
+```bash
+python eval.py
+python eval_live.py
+python eval_hard.py
 ```
-python eval.py          # mock gold dataset, runs standalone
-python eval_live.py     # live pipeline against an already-indexed repo
-python eval_hard.py     # same, with ground truth written from source
-```
 
-Three LLM-judged metrics: **Faithfulness** (0.75), **Answer Relevancy**
-(0.70), **Contextual Recall** (0.70).
+- `eval.py` defines the DeepEval metrics and includes a standalone mock dataset.
+- `eval_live.py` evaluates the pipeline against an already-indexed repository.
+- `eval_hard.py` uses reference answers written from repository source code before the evaluation, reducing the risk of circular ground truth.
 
-`eval_hard.py` exists because of a real methodology failure worth
-documenting. An earlier run scored Contextual Recall **1.000** — but its
-expected answers had been written *after* reading what the pipeline produced.
-Since that metric asks "does the retrieved context support the expected
-answer?", expectations derived from observed output cannot meaningfully fail.
-Rewriting the ground truth from the source first dropped recall to **0.917**,
-which is the number worth trusting.
+The three metrics are:
 
-A second caveat found the same way: with a `gpt-4o-mini` judge, one question
-scored Faithfulness **0.00** for a claim that was verifiably present in the
-retrieved chunk — the judge lost the detail in ~50K characters of context.
-The same case scored **1.00** under `gpt-4o`. **Validate the evaluator, not
-just the system.**
-
-Judge calls are token-heavy: a Faithfulness judgment over a full context can
-request ~13,000 tokens, so on a 30,000 TPM tier only about two fit per
-minute. `eval_hard.py` paces itself via `MINDAI_JUDGE_SPACING` (default 30s).
-
-## What citation validation does and does not guarantee
-
-The system's central claim is "no hallucination", so it's worth being exact
-about what is enforced:
-
-| Check | Enforced? |
+| Metric | What it measures |
 |---|---|
-| The cited file was actually retrieved | **Yes** |
-| The cited line range overlaps a retrieved chunk | **Yes** |
-| Citation format `path:start-end` (with a lenient fallback) | **Yes** |
-| That those lines actually *say* what the answer claims | **No** |
+| Faithfulness | Whether the generated answer is supported by the retrieved context |
+| Answer Relevancy | Whether the answer addresses the user's question |
+| Contextual Recall | Whether the retrieved context contains the information needed for the reference answer |
 
-So fabricated sources — invented files, invented line numbers — are caught
-and the answer is discarded. A claim that *misreads real code it correctly
-cited* is not caught here; that is what the Faithfulness metric measures.
-Validation happens **after** generation rather than as a pre-generation
-confidence threshold: three score-based gates were tried and removed, because
-the reranker's scores sat near zero even for answers that were correct (it
-was trained on web search, not code). Confirming what the model *did* cite
-beats predicting what it *could* cite.
+### Reported Evaluation Results
 
-On a validation failure the pipeline **retries once**, re-prompting with the
-list of valid paths, before falling back to a refusal.
+The project CV reports the following DeepEval scores on a 705-chunk codebase:
 
-## Known constraints (read before deploying beyond local/solo use)
+| Metric | Reported score |
+|---|---:|
+| Faithfulness | 0.967 |
+| Answer Relevancy | 0.987 |
+| Contextual Recall | 0.917 |
 
-- **Qdrant mode is chosen by `QDRANT_URL`.** Set it (plus `QDRANT_API_KEY`)
-  to point at Qdrant Cloud or a Qdrant container, and the pipeline talks to
-  it over HTTP — the server handles concurrency, so ingestions and chat
-  questions run in parallel. Leave it unset and the client falls back to
-  local/on-disk mode at `MINDAI_QDRANT_PATH`, which is **not** thread-safe
-  for concurrent access (confirmed against Qdrant's own source and an open
-  upstream issue); the backend then guards every call with a process-wide
-  lock, so only one ingestion or one chat question runs at a time,
-  server-wide. Fine for a single user, a real ceiling beyond that — see
-  `backend/pipeline_store.py`'s docstring. Note the two modes have separate
-  storage: collections ingested in one are not visible in the other.
-- **SQLite by default.** Fine for development; set `DATABASE_URL` to a
-  Postgres DSN for anything beyond local use.
-- **Dense embedding and reranking are API calls, not local CPU.** Dense
-  embedding goes to OpenAI (concurrent batches of 100) and reranking to
-  Cohere when `MINDAI_COHERE_API_KEY` is set. Per-node profiling put a
-  question at ~10s total, almost entirely network latency to three
-  providers — Qdrant search itself is ~0.25s. Without the Cohere key,
-  reranking falls back to a local sentence-transformers CrossEncoder, which
-  is CPU-bound and slower.
-- **Chat is not token-streamed.** The SSE endpoint streams status updates
-  and the finished answer, not token-by-token generation — the LangGraph
-  pipeline returns its final state as one unit. True token streaming would
-  mean changing `generate_node`'s OpenAI call to `stream=True`.
-- **Fallback chunking is line-based.** tree-sitter handles supported
-  languages; anything it can't parse (notebooks, markdown, config) falls
-  back to 100-line windows with 20 lines of overlap rather than
-  token-aware chunks. An AST chunk over `MAX_CHUNK_TOKENS` (6000) is split
-  to stay under the embedding API's 8192-token hard limit.
-- **Call-graph extraction is approximate.** Caller/callee edges come from a
-  regex scan of chunk bodies, so dynamic dispatch, reflection, and
-  dependency injection are not resolved. Treat expansion as a helpful hint,
-  not a complete call graph.
-- **No incremental re-indexing.** Ingesting a repo captures one snapshot;
-  new commits require re-ingesting, and nothing detects staleness.
-- **Broad conceptual questions are the weak spot.** Questions like "how does
-  X work?" where no single chunk is a strong match still sometimes refuse.
-  Query decomposition would be the fix.
+These are run-specific scores, not a guarantee of performance on every repository or question.
+
+**Reproducibility note:** The repository audit documents that a fresh end-to-end evaluation after subsequent code changes could not be completed because the OpenAI account exhausted its available credits. Re-run the evaluation scripts against the intended indexed collection to establish scores for the current implementation. Do not treat the historical scores as a verified benchmark of later changes.
+
+The evaluation process also exposed an important methodology issue: reference answers written after observing the system's output can inflate contextual recall. The hard evaluation script instead uses reference answers derived directly from repository source.
+
+LLM-judged metrics can also be sensitive to judge-model choice and long contexts. Evaluation scores should therefore be interpreted alongside test coverage, retrieval behavior, and manual inspection of representative answers.
+
+## Performance and Engineering Considerations
+
+The project CV reports reducing repository-ingestion latency from approximately 48 seconds to under 20 seconds using hosted embeddings and parallel processing.
+
+Dense embeddings are generated through the OpenAI API, with concurrent batches. Hosted Cohere reranking is used when configured; otherwise, reranking falls back to the local CrossEncoder.
+
+Query latency depends on network access and the configured providers. Repository ingestion and query-answering latency are separate measurements.
+
+## Known Limitations
+
+- **Citation validation is not semantic proof.** A real source location may still be interpreted incorrectly by the LLM.
+- **Call-graph extraction is approximate.** Regex-based extraction cannot resolve every dynamic call, reflection pattern, or dependency-injection relationship.
+- **No incremental re-indexing.** A repository index represents a snapshot. New commits require re-ingestion.
+- **Local Qdrant mode limits concurrency.** The backend serializes pipeline access with a process-wide lock when using local on-disk storage. A Qdrant server or cloud deployment is more appropriate for concurrent workloads.
+- **SQLite is the default database.** Configure a suitable database such as PostgreSQL for a larger deployment.
+- **Fallback chunking is line-based.** Unsupported file formats fall back to line windows rather than full AST parsing.
+- **Broad conceptual questions remain challenging.** Questions that require information distributed across many files may not retrieve sufficient evidence and can result in a refusal.
+- **Evaluation requires API access and credits.** DeepEval's LLM-based judges can be expensive and sensitive to model choice and context length.
+- **Repository freshness is not automatic.** The system does not continuously synchronize an index with new repository commits.
+
+## Future Improvements
+
+Potential improvements include:
+
+- Incremental re-indexing after Git commits.
+- More robust call-graph construction using language-aware symbol resolution.
+- Better query decomposition for questions spanning multiple files.
+- Broader evaluation datasets with source-derived reference answers.
+- End-to-end regression evaluation after changes to retrieval, reranking, or generation.
+- Improved citation verification that evaluates semantic support in addition to source provenance.
+- Better observability for indexing latency, retrieval quality, and per-stage query latency.
+
+## License
+
+See the repository's license file for usage and distribution terms.
